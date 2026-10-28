@@ -16,7 +16,7 @@ from pathlib import Path
 # --- 0. BILINGUAL LOCALIZATION (i18n) ---
 L = {
     "EN": {
-        "title": "Japan sentinel surveillance",
+        "title": "Japan infectious disease surveillance: sentinel reports",
         "subtitle": "",
         "sidebar_header": "Dashboard Settings",
         "lang_selector": "Language / 言語:",
@@ -57,7 +57,7 @@ L = {
         "select_at_least_one": "Please check at least one disease."
     },
     "JA": {
-        "title": "🇯🇵 日本感染症サーベイランス・ダッシュボード (2023–2026)",
+        "title": "日本の感染症発生動向調査：定点報告",
         "subtitle": "",
         "sidebar_header": "設定・操作",
         "lang_selector": "言語 / Language:",
@@ -533,15 +533,34 @@ def on_chart_select(*args, **kwargs):
 
 # --- 4. SIDEBAR CONTROLS ---
 st.sidebar.markdown("---")
-selected_diseases = st.sidebar.multiselect(
-    "Diseases (choose up to two)" if lang == "EN" else "疾患（2つまで選択）",
-    options=list(DISEASES), default=["COVID-19", "Influenza"],
+st.session_state.setdefault("disease_first", "COVID-19")
+st.session_state.setdefault("disease_second", "Influenza")
+st.session_state.setdefault("previous_first", st.session_state.disease_first)
+st.session_state.setdefault("previous_second", st.session_state.disease_second)
+
+def change_first_disease():
+    if st.session_state.disease_first == st.session_state.disease_second:
+        st.session_state.disease_second = st.session_state.previous_first
+    st.session_state.previous_first = st.session_state.disease_first
+    st.session_state.previous_second = st.session_state.disease_second
+
+def change_second_disease():
+    if st.session_state.disease_second == st.session_state.disease_first:
+        old_second = st.session_state.previous_second
+        if old_second is None:
+            st.session_state.disease_second = None
+        else:
+            st.session_state.disease_first = old_second
+    st.session_state.previous_first = st.session_state.disease_first
+    st.session_state.previous_second = st.session_state.disease_second
+
+st.sidebar.selectbox("Disease 1 / 疾患1", options=list(DISEASES),
     format_func=lambda disease: DISEASE_TRANSLATIONS[disease][lang],
-    max_selections=2, key="selected_diseases",
-)
-if not selected_diseases:
-    st.sidebar.warning("Select at least one disease." if lang == "EN" else "疾患を1つ以上選択してください。")
-    st.stop()
+    key="disease_first", on_change=change_first_disease)
+st.sidebar.selectbox("Disease 2 / 疾患2", options=[None, *DISEASES],
+    format_func=lambda disease: ("None" if lang == "EN" else "なし") if disease is None else DISEASE_TRANSLATIONS[disease][lang],
+    key="disease_second", on_change=change_second_disease)
+selected_diseases = [d for d in (st.session_state.disease_first, st.session_state.disease_second) if d is not None]
 
 metric_type = st.sidebar.radio(
     tx["metric_selector"],
@@ -564,6 +583,11 @@ current_csv_url = source_rows.iloc[0]['source'] if not source_rows.empty else No
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"### {tx['source_data_lbl']}")
 st.sidebar.caption(tx["source_desc"])
+st.sidebar.caption(
+    "Unofficial summary. The JIHS website is the official source; provisional data may be revised." if lang == "EN"
+    else "このサイトは非公式の集計です。公式情報はJIHSのサイトをご確認ください。速報値は修正される場合があります。"
+)
+st.sidebar.link_button("Official JIHS surveillance data" if lang == "EN" else "JIHS感染症発生動向調査（公式）", "https://id-info.jihs.go.jp/surveillance/idwr/index.html")
 if current_csv_url and current_csv_url.startswith("https://"):
     st.sidebar.link_button(tx["download_csv"].format(year=active_year, week=active_week), current_csv_url, width="stretch")
 elif current_csv_url and Path(current_csv_url).is_file():
@@ -754,6 +778,7 @@ if geojson_data:
 
 df_table = df_piv.sort_values(by=selected_diseases[0], ascending=False, na_position="last")
 table_display = pd.DataFrame(index=df_table['display_pref'])
+table_display.index.name = 'Prefecture' if lang == 'EN' else '都道府県'
 for disease in selected_diseases:
     table_display[DISEASE_TRANSLATIONS[disease][lang]] = df_table[disease].values
 
@@ -767,10 +792,14 @@ def on_table_select():
     else:
         st.session_state.active_pref_zoom = None
 
-try:
-    st.dataframe(
-        table_display, width="stretch", key="pref_table",
-        on_select=on_table_select, selection_mode="single-row"
-    )
-except TypeError:
-    st.dataframe(table_display, use_container_width=True)
+st.caption(":material/search: Select a row to zoom to a prefecture" if lang == "EN" else ":material/search: 行を選択して都道府県を拡大")
+number_columns = {
+    DISEASE_TRANSLATIONS[disease][lang]: st.column_config.NumberColumn(
+        width="small", format="%.2f" if metric_type == "rate" else "%.0f")
+    for disease in selected_diseases
+}
+st.dataframe(
+    table_display, width="content", key="pref_table", column_config=number_columns,
+    on_select=on_table_select, selection_mode="single-row",
+    alt="Prefecture surveillance data" if lang == "EN" else "都道府県別の定点報告数",
+)
