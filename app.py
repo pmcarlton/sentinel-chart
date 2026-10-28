@@ -21,7 +21,7 @@ L = {
         "metric_selector": "Display Metric:",
         "metric_rate": "Cases per Sentinel Clinic (定点当たり)",
         "metric_count": "Total Reported Cases (報告数)",
-        "week_slider": "Slider Week Position:",
+        "week_slider": "Timeline Position:",
         "backfill_header": "Data Management",
         "backfill_btn": "Run Full Backfill (2023 W19 → Present)",
         "nat_avg_label": "National Sentinel Average",
@@ -39,11 +39,15 @@ L = {
         "status_low": "Baseline (<15) 🟢",
         "chart_advisory": "Advisory (10.0)",
         "chart_warning": "Warning (30.0)",
-        "slider_lbl": "Slider #",
+        "slider_lbl": "Position",
         "week_lbl": "Week",
         "date_lbl": "Date",
         "click_hint": " (Click to jump to this week)",
-        "no_data": "Database empty. Run the backfill button in the sidebar or upload a CSV."
+        "no_data": "Database empty. Run the backfill button in the sidebar or upload a CSV.",
+        "source_data_lbl": "Source Data & References",
+        "source_desc": "Data sourced directly from the Japan Institute for Health Security (JIHS) IDWR provisional sentinel feeds.",
+        "download_csv": "Download Official CSV for {year}-W{week:02d}",
+        "clear_sel": "Clear Table Selection & Reset Map"
     },
     "JA": {
         "title": "🇯🇵 日本感染症サーベイランス・ダッシュボード (2023–2026)",
@@ -54,7 +58,7 @@ L = {
         "metric_selector": "表示指標:",
         "metric_rate": "定点当たり報告数（定当）",
         "metric_count": "報告数（患者総数）",
-        "week_slider": "スライダー週位置:",
+        "week_slider": "タイムライン位置:",
         "backfill_header": "データ管理",
         "backfill_btn": "全履歴バックフィルを実行 (2023年19週〜)",
         "nat_avg_label": "全国定点当たり平均",
@@ -72,11 +76,15 @@ L = {
         "status_low": "平常水準 🟢",
         "chart_advisory": "注意報基準 (10.0)",
         "chart_warning": "警報基準 (30.0)",
-        "slider_lbl": "スライダー番号",
+        "slider_lbl": "位置",
         "week_lbl": "週",
         "date_lbl": "日付",
         "click_hint": " (クリックでこの週に移動)",
-        "no_data": "データベースが空です。サイドバーのバックフィルを実行するかCSVを読み込んでください。"
+        "no_data": "データベースが空です。サイドバーのバックフィルを実行するかCSVを読み込んでください。",
+        "source_data_lbl": "データソース・参照元",
+        "source_desc": "国立健康危機管理研究機構（JIHS）の感染症発生動向調査（IDWR）速報データを使用しています。",
+        "download_csv": "{year}年第{week:02d}週の公式CSVをダウンロード",
+        "clear_sel": "選択解除・マップを元に戻す"
     }
 }
 
@@ -102,7 +110,20 @@ PREFECTURES = [
 PREF_JP_TO_EN = {jp: en for jp, en in PREFECTURES}
 DB_NAME = "japan_surveillance_verified.db"
 
-# --- 1. PERSISTENCE ENGINE ---
+# --- 1. COMPATIBILITY HELPERS ---
+def safe_plotly(fig, **kwargs):
+    try:
+        return st.plotly_chart(fig, width="stretch", **kwargs)
+    except TypeError:
+        return st.plotly_chart(fig, use_container_width=True, **kwargs)
+
+def safe_dataframe(df, **kwargs):
+    try:
+        return st.dataframe(df, width="stretch", **kwargs)
+    except TypeError:
+        return st.dataframe(df, use_container_width=True, **kwargs)
+
+# --- 2. PERSISTENCE ENGINE ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -122,7 +143,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# --- 2. CSV PARSER ---
+# --- 3. CSV PARSER & BACKFILL ENGINE ---
 def parse_teiten_csv(raw_bytes, fallback_year=None, fallback_week=None):
     text = None
     for enc in ['cp932', 'shift_jis', 'utf-8']:
@@ -236,12 +257,10 @@ def load_local_csvs():
         except Exception:
             pass
 
-# --- 3. MULTI-YEAR BACKFILL ENGINE ---
 def execute_backfill(progress_bar, status_text):
     init_db()
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-
     weeks_list = []
     for w in range(19, 53): weeks_list.append((2023, w))
     for w in range(1, 53): weeks_list.append((2024, w))
@@ -264,24 +283,17 @@ def execute_backfill(progress_bar, status_text):
             f"https://www.niid.go.jp/niid/images/idwr/sokuho/idwr-{y}/{y}{w:02d}/{y}-{w:02d}-teiten.csv",
             f"https://www.niid.go.jp/niid/images/idwr/sokuho/idwr-{y}/{str(y)[2:]}{w:02d}/{str(y)[2:]}-{w:02d}-teiten.csv"
         ]
-        
         recs = None
         for u in urls:
             try:
                 resp = requests.get(u, headers=headers, timeout=4)
                 if resp.status_code == 200 and len(resp.content) > 1000:
                     _, _, recs = parse_teiten_csv(resp.content, fallback_year=y, fallback_week=w)
-                    if recs:
-                        break
+                    if recs: break
             except Exception:
                 pass
-
         if recs:
-            c.executemany('''
-                INSERT OR REPLACE INTO weekly_records 
-                (year, week, jis_id, prefecture_jp, prefecture_en, disease, cases_count, cases_per_sentinel)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', recs)
+            c.executemany('''INSERT OR REPLACE INTO weekly_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', recs)
             conn.commit()
             success += 1
 
@@ -301,19 +313,18 @@ def get_japan_geojson():
     except Exception:
         return None
 
-def extract_selected_index(event_or_state):
-    """Safely extracts the clicked slider index from a Plotly selection event."""
-    if not event_or_state:
+def extract_selected_index(chart_state):
+    if not chart_state:
         return None
-    sel = getattr(event_or_state, "selection", None)
-    if sel is None and isinstance(event_or_state, dict):
-        sel = event_or_state.get("selection", event_or_state)
+    sel = getattr(chart_state, "selection", None)
+    if sel is None and isinstance(chart_state, dict):
+        sel = chart_state.get("selection", chart_state)
     if not sel:
         return None
     pts = getattr(sel, "points", None)
     if pts is None and isinstance(sel, dict):
         pts = sel.get("points", [])
-    if not pts or len(pts) == 0:
+    if not pts:
         return None
     first_pt = pts[0]
     c_data = getattr(first_pt, "customdata", None)
@@ -330,19 +341,32 @@ def extract_selected_index(event_or_state):
         return int(first_pt.point_index)
     return None
 
-# --- 4. STREAMLIT APPLICATION ---
+def get_chart_signature(chart_state):
+    if not chart_state:
+        return None
+    sel = getattr(chart_state, "selection", None) or (chart_state.get("selection") if isinstance(chart_state, dict) else None)
+    if not sel:
+        return None
+    pts = getattr(sel, "points", None) or (sel.get("points") if isinstance(sel, dict) else None)
+    if not pts:
+        return None
+    p0 = pts[0]
+    p_idx = getattr(p0, "point_index", None) or (p0.get("point_index") if isinstance(p0, dict) else None)
+    p_x = getattr(p0, "x", None) or (p0.get("x") if isinstance(p0, dict) else None)
+    return (p_idx, str(p_x))
+
+# --- 4. APPLICATION START ---
 st.set_page_config(page_title="Japan Sentinel Archive", layout="wide")
 
 init_db()
 load_local_csvs()
 
-# Language
+# UI Setup
 st.sidebar.markdown("### Settings / 設定")
 lang_select = st.sidebar.radio("Language / 言語:", ["English", "日本語"])
 lang = "EN" if lang_select == "English" else "JA"
 tx = L[lang]
 
-# Backfill Controls in Sidebar
 st.sidebar.markdown(f"### {tx['backfill_header']}")
 if st.sidebar.button(tx["backfill_btn"]):
     p_bar = st.sidebar.progress(0)
@@ -350,7 +374,6 @@ if st.sidebar.button(tx["backfill_btn"]):
     execute_backfill(p_bar, p_text)
     st.rerun()
 
-# Safe Read from DB
 conn = sqlite3.connect(DB_NAME)
 df_all = pd.read_sql("SELECT * FROM weekly_records ORDER BY year ASC, week ASC", conn)
 conn.close()
@@ -361,31 +384,44 @@ if df_all.empty:
     st.info("Click **'Run Full Backfill'** in the sidebar to download the historical archive, or place `2026-41-teiten.csv` in this folder.")
     st.stop()
 
-# Generate proper datetime representation
+# Generate labels & map timeline index
 df_all['date'] = df_all.apply(lambda r: datetime.date.fromisocalendar(int(r['year']), int(r['week']), 5), axis=1)
 df_all['date'] = pd.to_datetime(df_all['date'])
 df_all['week_label'] = df_all.apply(lambda r: f"{r['year']} W{r['week']:02d}", axis=1)
 
-# Sequence of unique available weeks
 available_weeks = df_all[['year', 'week', 'week_label']].drop_duplicates().sort_values(by=['year', 'week']).reset_index(drop=True)
 total_available = len(available_weeks)
+week_to_idx = {(int(row['year']), int(row['week'])): idx for idx, row in available_weeks.iterrows()}
 
-# Fast mapping from (year, week) to slider index
-week_to_idx = {
-    (int(row['year']), int(row['week'])): idx 
-    for idx, row in available_weeks.iterrows()
-}
-
-# Check if there is a pending index update from a click event
-if "pending_week_slider_idx" in st.session_state:
-    st.session_state.week_slider_idx = st.session_state.pop("pending_week_slider_idx")
-
-
-# Ensure session state slider index is properly initialized
 if "week_slider_idx" not in st.session_state:
     st.session_state.week_slider_idx = total_available - 1
 elif st.session_state.week_slider_idx >= total_available:
     st.session_state.week_slider_idx = total_available - 1
+
+if "last_seen_chart_sig" not in st.session_state:
+    st.session_state.last_seen_chart_sig = None
+    
+# Safely handle table row selection for zooming
+if "active_pref_zoom" not in st.session_state:
+    st.session_state.active_pref_zoom = None
+
+# Timeline interaction capture
+active_chart_state = st.session_state.get("trend_chart")
+current_sig = get_chart_signature(active_chart_state)
+if current_sig is not None and current_sig != st.session_state.last_seen_chart_sig:
+    st.session_state.last_seen_chart_sig = current_sig
+    clicked_from_state = extract_selected_index(active_chart_state)
+    if clicked_from_state is not None and 0 <= clicked_from_state < total_available:
+        st.session_state.week_slider_idx = clicked_from_state
+
+def on_chart_select(*args, **kwargs):
+    c_state = st.session_state.get("trend_chart")
+    idx = extract_selected_index(c_state)
+    if idx is not None and 0 <= idx < total_available:
+        st.session_state.week_slider_idx = idx
+        st.session_state.last_seen_chart_sig = get_chart_signature(c_state)
+        # Clear map zoom if timeline week is changed
+        st.session_state.active_pref_zoom = None 
 
 # Filters
 st.sidebar.markdown("---")
@@ -402,22 +438,24 @@ metric_type = st.sidebar.radio(
 )
 val_col = "cases_per_sentinel" if metric_type == "rate" else "cases_count"
 
-# Slider bound to session_state
 slider_idx = st.sidebar.slider(
     f"{tx['week_slider']} (0 – {total_available - 1})",
-    min_value=0,
-    max_value=total_available - 1,
-    key="week_slider_idx"
+    min_value=0, max_value=total_available - 1, key="week_slider_idx"
 )
 
 active_year = int(available_weeks.iloc[slider_idx]['year'])
 active_week = int(available_weeks.iloc[slider_idx]['week'])
 
-st.sidebar.caption(f"📍 Active: **Slider #{slider_idx}** → `{active_year}-W{active_week:02d}`")
+# Current data source download button in Sidebar
+current_csv_url = f"https://id-info.jihs.go.jp/surveillance/idwr/provisional/{active_year}/{active_week:02d}/{active_year}-{active_week:02d}-teiten.csv"
+st.sidebar.markdown("---")
+st.sidebar.markdown(f"### {tx['source_data_lbl']}")
+st.sidebar.caption(tx["source_desc"])
+st.sidebar.link_button(tx["download_csv"].format(year=active_year, week=active_week), current_csv_url, use_container_width=True)
 
 df_disease = df_all[df_all['disease'] == selected_disease_key].copy()
 
-# Header
+# Headings
 st.title(tx["title"])
 st.caption(tx["subtitle"])
 
@@ -428,11 +466,9 @@ else:
     nat_series = df_disease.groupby(['year', 'week', 'date'])[val_col].sum().reset_index()
 nat_series = nat_series.sort_values(by='date').reset_index(drop=True)
 
-# Attach slider index and week tag
 nat_series['slider_idx'] = nat_series.apply(lambda r: week_to_idx.get((int(r['year']), int(r['week'])), 0), axis=1)
 nat_series['week_tag'] = nat_series.apply(lambda r: f"{int(r['year'])}-W{int(r['week']):02d}", axis=1)
 
-# Metrics for the selected slider week
 curr_row = nat_series[(nat_series['year'] == active_year) & (nat_series['week'] == active_week)]
 curr_val = curr_row[val_col].iloc[0] if not curr_row.empty else 0.0
 
@@ -454,27 +490,21 @@ else:
     status_str = tx["status_high"] if curr_rate >= 15 else tx["status_low"]
     c2.metric(tx["trans_level_covid"], status_str)
 
-c3.metric("Selected Period", f"{active_year} Week {active_week:02d}", f"Slider #{slider_idx} of {total_available - 1}")
+c3.metric("Selected Period", f"{active_year} Week {active_week:02d}", f"{tx['slider_lbl']} {slider_idx} of {total_available - 1}")
 
 # Multi-Year Trend Chart
 metric_name_display = tx["metric_rate"] if metric_type == "rate" else tx["metric_count"]
 st.subheader(tx["hist_trend"].format(disease=DISEASE_TRANSLATIONS[selected_disease_key][lang], metric=metric_name_display))
 
-# Build figure with explicit markers and custom data
 fig_curve = px.line(
-    nat_series, 
-    x='date', 
-    y=val_col,
-    markers=True,
+    nat_series, x='date', y=val_col, markers=True,
     custom_data=['slider_idx', 'week_tag', 'year', 'week'],
-    labels={'date': 'Date', val_col: metric_name_display},
-    template="plotly_white"
+    labels={'date': 'Date', val_col: metric_name_display}, template="plotly_white"
 )
 
 hover_val_fmt = ":.2f" if metric_type == "rate" else ":,d"
 fig_curve.update_traces(
-    mode='lines+markers',
-    marker=dict(size=7, opacity=0.85),
+    mode='lines+markers', marker=dict(size=7, opacity=0.85),
     line=dict(color="#e63946" if selected_disease_key == "COVID-19" else "#457b9d", width=2.5),
     hovertemplate=(
         f"<b>{tx['slider_lbl']}: %{{customdata[0]}}</b>{tx['click_hint']}<br>" +
@@ -483,23 +513,11 @@ fig_curve.update_traces(
         f"{metric_name_display}: %{{y{hover_val_fmt}}}<extra></extra>"
     )
 )
+fig_curve.update_layout(clickmode='event+select', hovermode='closest')
 
-# Enable single-click point selection
-fig_curve.update_layout(
-    clickmode='event+select',
-    hovermode='closest'
-)
-
-# Vertical marker for selected slider week
 active_date_val = curr_row['date'].iloc[0] if not curr_row.empty else None
 if active_date_val is not None:
-    fig_curve.add_vline(
-        x=active_date_val, 
-        line_dash="dash", 
-        line_color="#222222", 
-        annotation_text=f"Selected: Slider #{slider_idx} ({active_year}-W{active_week:02d})",
-        annotation_position="top left"
-    )
+    fig_curve.add_vline(x=active_date_val, line_dash="dash", line_color="#222222", annotation_text=f"Selected: {active_year}-W{active_week:02d}", annotation_position="top left")
 
 if metric_type == "rate":
     if selected_disease_key == "Influenza":
@@ -508,51 +526,77 @@ if metric_type == "rate":
     else:
         fig_curve.add_hline(y=15.0, line_dash="dot", line_color="red", annotation_text="Wave Threshold (15.0)")
 
-# Render Chart and capture click selection
-chart_event = st.plotly_chart(
-    fig_curve,
-    width='stretch',
-    key="trend_chart",
-    on_select="rerun",
-    selection_mode="points"
-)
+try:
+    safe_plotly(fig_curve, key="trend_chart", on_select=on_chart_select, selection_mode="points")
+except TypeError:
+    safe_plotly(fig_curve)
 
-# Trap click event and immediately update state
-clicked_idx = extract_selected_index(chart_event)
-if clicked_idx is not None and clicked_idx != st.session_state.week_slider_idx:
-    if st.session_state.get("week_slider_idx") != clicked_idx:
-        st.session_state.pending_week_slider_idx = clicked_idx
-        st.rerun()
-
-# Heatmap & Table for Selected Week
+# Active Week Data
 st.subheader(tx["heatmap"].format(year=active_year, week=active_week))
 df_active = df_disease[(df_disease['year'] == active_year) & (df_disease['week'] == active_week)].copy()
 df_active['display_pref'] = df_active['prefecture_en'] if lang == "EN" else df_active['prefecture_jp']
 
+# Determine if a single prefecture zoom is requested
+zoom_pref_jp = st.session_state.active_pref_zoom
+
+if zoom_pref_jp:
+    if st.button(tx["clear_sel"], icon="🔄"):
+        st.session_state.active_pref_zoom = None
+        st.rerun()
+
 geojson_data = get_japan_geojson()
-col_map, col_table = st.columns([3, 2])
 
-with col_map:
-    if geojson_data and not df_active.empty:
-        fig_map = px.choropleth(
-            df_active,
-            geojson=geojson_data,
-            locations="prefecture_jp",
-            featureidkey="properties.nam_ja",
-            color=val_col,
-            color_continuous_scale="Reds",
-            range_color=(0, max(20, float(df_active[val_col].max()))),
-            hover_name="display_pref",
-            hover_data={"prefecture_jp": False, "cases_per_sentinel": ":.2f", "cases_count": ":,.0f"},
-            labels={"cases_per_sentinel": tx["metric_rate"], "cases_count": tx["metric_count"]}
-        )
+# Full-Width Map (Placed above the table for maximum size)
+if geojson_data and not df_active.empty:
+    fig_map = px.choropleth(
+        df_active,
+        geojson=geojson_data,
+        locations="prefecture_jp",
+        featureidkey="properties.nam_ja",
+        color=val_col,
+        color_continuous_scale="Reds",
+        range_color=(0, max(20, float(df_active[val_col].max()))),
+        hover_name="display_pref",
+        hover_data={"prefecture_jp": False, "cases_per_sentinel": ":.2f", "cases_count": ":,.0f"},
+        labels={"cases_per_sentinel": tx["metric_rate"], "cases_count": tx["metric_count"]}
+    )
+    
+    # If a prefecture was clicked in the table below, force the map boundaries to zoom in on it
+    if zoom_pref_jp:
         fig_map.update_geos(fitbounds="locations", visible=False)
-        fig_map.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0})
-        st.plotly_chart(fig_map, width='stretch')
+        fig_map.update_traces(locations=[zoom_pref_jp], z=df_active[df_active['prefecture_jp'] == zoom_pref_jp][val_col])
     else:
-        st.bar_chart(df_active.set_index('display_pref')[val_col])
+        fig_map.update_geos(fitbounds="locations", visible=False)
+        
+    fig_map.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0}, height=550)
+    safe_plotly(fig_map)
+else:
+    safe_barchart(df_active.set_index('display_pref')[val_col])
 
-with col_table:
-    sorted_df = df_active.sort_values(by=val_col, ascending=False)[['display_pref', 'cases_per_sentinel', 'cases_count']]
-    sorted_df.columns = [tx["table_pref"], tx["metric_rate"], tx["metric_count"]]
-    st.dataframe(sorted_df.reset_index(drop=True), height=440, width='stretch')
+# Data Table below the Map with Click-to-Zoom handling
+sorted_df = df_active.sort_values(by=val_col, ascending=False)[['prefecture_jp', 'display_pref', 'cases_per_sentinel', 'cases_count']]
+display_table_df = sorted_df[['display_pref', 'cases_per_sentinel', 'cases_count']].copy()
+display_table_df.columns = [tx["table_pref"], tx["metric_rate"], tx["metric_count"]]
+display_table_df = display_table_df.set_index(tx["table_pref"])
+
+def on_table_select():
+    sel_state = st.session_state.get("pref_table")
+    rows = getattr(sel_state, "selection", {}).get("rows", []) if sel_state else []
+    if rows:
+        selected_idx = rows[0]
+        # Match back to original JP name to filter the GeoJSON map appropriately
+        selected_pref_jp = sorted_df.iloc[selected_idx]['prefecture_jp']
+        st.session_state.active_pref_zoom = selected_pref_jp
+    else:
+        st.session_state.active_pref_zoom = None
+
+try:
+    st.dataframe(
+        display_table_df, 
+        use_container_width=True, 
+        key="pref_table",
+        on_select=on_table_select, 
+        selection_mode="single-row"
+    )
+except TypeError:
+    st.dataframe(display_table_df, use_container_width=True)
