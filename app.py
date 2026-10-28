@@ -99,10 +99,30 @@ L = {
     }
 }
 
-DISEASE_TRANSLATIONS = {
-    "COVID-19": {"EN": "COVID-19", "JA": "新型コロナ (COVID-19)"},
-    "Influenza": {"EN": "Influenza", "JA": "インフルエンザ"}
+# Stable database IDs, source column names and bilingual labels.
+DISEASES = {
+    "COVID-19": ("COVID-19", "COVID-19", "新型コロナ (COVID-19)"),
+    "Influenza": ("インフルエンザ", "Influenza", "インフルエンザ"),
+    "RSV": ("ＲＳウイルス感染症", "RS virus infection", "RSウイルス感染症"),
+    "Pharyngoconjunctival fever": ("咽頭結膜熱", "Pharyngoconjunctival fever", "咽頭結膜熱"),
+    "Group A streptococcal pharyngitis": ("Ａ群溶血性レンサ球菌咽頭炎", "Group A streptococcal pharyngitis", "A群溶血性レンサ球菌咽頭炎"),
+    "Infectious gastroenteritis": ("感染性胃腸炎", "Infectious gastroenteritis", "感染性胃腸炎"),
+    "Varicella": ("水痘", "Chickenpox", "水痘"),
+    "Hand, foot and mouth disease": ("手足口病", "Hand, foot and mouth disease", "手足口病"),
+    "Erythema infectiosum": ("伝染性紅斑", "Erythema infectiosum", "伝染性紅斑"),
+    "Exanthema subitum": ("突発性発しん", "Exanthema subitum", "突発性発しん"),
+    "Herpangina": ("ヘルパンギーナ", "Herpangina", "ヘルパンギーナ"),
+    "Mumps": ("流行性耳下腺炎", "Mumps", "流行性耳下腺炎"),
+    "Acute hemorrhagic conjunctivitis": ("急性出血性結膜炎", "Acute hemorrhagic conjunctivitis", "急性出血性結膜炎"),
+    "Epidemic keratoconjunctivitis": ("流行性角結膜炎", "Epidemic keratoconjunctivitis", "流行性角結膜炎"),
+    "Bacterial meningitis": ("細菌性髄膜炎", "Bacterial meningitis", "細菌性髄膜炎"),
+    "Aseptic meningitis": ("無菌性髄膜炎", "Aseptic meningitis", "無菌性髄膜炎"),
+    "Mycoplasma pneumonia": ("マイコプラズマ肺炎", "Mycoplasma pneumonia", "マイコプラズマ肺炎"),
+    "Chlamydial pneumonia": ("クラミジア肺炎", "Chlamydial pneumonia", "クラミジア肺炎"),
+    "Rotavirus gastroenteritis": ("感染性胃腸炎（ロタウイルス）", "Rotavirus gastroenteritis", "感染性胃腸炎（ロタウイルス）"),
 }
+DISEASE_TRANSLATIONS = {key: {"EN": value[1], "JA": value[2]} for key, value in DISEASES.items()}
+RECORDS_PER_WEEK = 48 * len(DISEASES)
 
 COLOR_COVID = "#c026d3"  # Vibrant Magenta
 COLOR_FLU = "#16a34a"    # Vibrant Green
@@ -207,16 +227,9 @@ def parse_teiten_csv(raw_bytes, fallback_year=None, fallback_week=None):
         return None, None, []
 
     disease_row = rows[disease_row_idx]
-    flu_col, covid_col = None, None
-    for j, cell in enumerate(disease_row):
-        c_clean = cell.strip()
-        if 'インフルエンザ' in c_clean and '鳥' not in c_clean:
-            flu_col = j
-        elif 'COVID' in c_clean.upper() or '新型コロナ' in c_clean:
-            covid_col = j
-
-    if flu_col is None or covid_col is None:
-        return None, None, []
+    columns = {name.strip(): i for i, name in enumerate(disease_row) if name.strip()}
+    if any(source not in columns for source, _, _ in DISEASES.values()):
+        raise ValueError("Missing expected disease column")
 
     pref_start_idx = None
     for idx, r in enumerate(rows):
@@ -246,11 +259,12 @@ def parse_teiten_csv(raw_bytes, fallback_year=None, fallback_week=None):
         raise ValueError("CSV reporting week does not match requested week")
     parsed_records = []
     for jis_id, row in [(0, national)] + list(enumerate(pref_rows, 1)):
-        if len(row) <= max(flu_col, covid_col) + 1:
+        if len(row) <= max(columns[source] for source, _, _ in DISEASES.values()) + 1:
             raise ValueError("Incomplete data row")
         pref_jp = row[0].strip()
         pref_en = 'Japan' if jis_id == 0 else PREF_JP_TO_EN[pref_jp]
-        for disease, col in (("Influenza", flu_col), ("COVID-19", covid_col)):
+        for disease, (source, _, _) in DISEASES.items():
+            col = columns[source]
             parsed_records.append((year, week, jis_id, pref_jp, pref_en, disease,
                                    safe_val(row[col]), safe_val(row[col + 1])))
 
@@ -278,12 +292,13 @@ def load_local_csvs():
                 continue
             year, week = map(int, match.groups())
             with sqlite3.connect(DB_NAME) as conn:
-                known = conn.execute("SELECT 1 FROM weekly_sources WHERE year=? AND week=?", (year, week)).fetchone()
-            if known:
+                known = conn.execute("SELECT source FROM weekly_sources WHERE year=? AND week=?", (year, week)).fetchone()
+                count = conn.execute("SELECT COUNT(*) FROM weekly_records WHERE year=? AND week=?", (year, week)).fetchone()[0]
+            if known and count == RECORDS_PER_WEEK:
                 continue
             _, _, records = parse_teiten_csv(filepath.read_bytes(), year, week)
             if records:
-                save_week(year, week, records, str(filepath))
+                save_week(year, week, records, known[0] if known else str(filepath))
         except (OSError, ValueError, IndexError) as exc:
             st.warning(f"{filepath}: {exc}")
 
@@ -310,7 +325,7 @@ def fetch_week(y, w):
                 continue
             response.raise_for_status()
             _, _, records = parse_teiten_csv(response.content, y, w)
-            if len(records) != 96:
+            if len(records) != RECORDS_PER_WEEK:
                 raise ValueError("Incomplete CSV")
             Path("data").mkdir(exist_ok=True)
             Path(f"data/{y}-{w:02d}-teiten.csv").write_bytes(response.content)
@@ -331,7 +346,7 @@ def automatic_update():
         if state and now - datetime.datetime.fromisoformat(state[0]) < interval:
             return False
         conn.execute("INSERT OR REPLACE INTO update_state VALUES (1, ?, ?)", (now.isoformat(), "checking"))
-        latest = conn.execute("SELECT year, week FROM weekly_records GROUP BY year, week HAVING COUNT(*) = 96 ORDER BY year DESC, week DESC LIMIT 1").fetchone()
+        latest = conn.execute("SELECT year, week FROM weekly_records GROUP BY year, week HAVING COUNT(*) = ? ORDER BY year DESC, week DESC LIMIT 1", (RECORDS_PER_WEEK,)).fetchone()
     today = datetime.datetime.now(ZoneInfo("Asia/Tokyo")).date()
     last_complete = today - datetime.timedelta(days=today.weekday() + 7)
     if latest:
@@ -364,7 +379,7 @@ def execute_backfill(progress_bar, status_text):
         start += datetime.timedelta(weeks=1)
     with sqlite3.connect(DB_NAME) as conn:
         complete = {(y, w) for y, w, n in conn.execute(
-            "SELECT year, week, COUNT(*) FROM weekly_records GROUP BY year, week HAVING COUNT(*) = 96")}
+            "SELECT year, week, COUNT(*) FROM weekly_records GROUP BY year, week HAVING COUNT(*) = ?", (RECORDS_PER_WEEK,))}
     failures = []
     for idx, (y, w) in enumerate(weeks):
         if (y, w) in complete and idx < len(weeks) - 8:
@@ -380,7 +395,7 @@ def execute_backfill(progress_bar, status_text):
 def combined_map_color(flu, covid, flu_max, covid_max):
     """Encode both levels in RGB, keeping every channel at or above 85."""
     if pd.isna(flu) or pd.isna(covid):
-        return "#a6c8ff"
+        return "#c6b86a"
     flu_fraction = min(1.0, max(0.0, flu / flu_max)) if flu_max > 0 else 0.0
     covid_fraction = min(1.0, max(0.0, covid / covid_max)) if covid_max > 0 else 0.0
     red_blue = round(255 - 170 * flu_fraction)
@@ -518,20 +533,15 @@ def on_chart_select(*args, **kwargs):
 
 # --- 4. SIDEBAR CONTROLS ---
 st.sidebar.markdown("---")
-st.sidebar.markdown(f"### {tx['disease_selector']}")
-col_cb1, col_cb2 = st.sidebar.columns(2)
-with col_cb1:
-    show_covid = st.checkbox(DISEASE_TRANSLATIONS["COVID-19"][lang], value=True)
-with col_cb2:
-    show_flu = st.checkbox(DISEASE_TRANSLATIONS["Influenza"][lang], value=True)
-
-if not show_covid and not show_flu:
-    st.sidebar.warning(tx["select_at_least_one"])
-    show_covid = True
-
-selected_diseases = []
-if show_covid: selected_diseases.append("COVID-19")
-if show_flu: selected_diseases.append("Influenza")
+selected_diseases = st.sidebar.multiselect(
+    "Diseases (choose up to two)" if lang == "EN" else "疾患（2つまで選択）",
+    options=list(DISEASES), default=["COVID-19", "Influenza"],
+    format_func=lambda disease: DISEASE_TRANSLATIONS[disease][lang],
+    max_selections=2, key="selected_diseases",
+)
+if not selected_diseases:
+    st.sidebar.warning("Select at least one disease." if lang == "EN" else "疾患を1つ以上選択してください。")
+    st.stop()
 
 metric_type = st.sidebar.radio(
     tx["metric_selector"],
@@ -587,6 +597,11 @@ with card_cols[-1]:
 
 # --- 6. MULTI-YEAR TREND LINE CHART ---
 st.subheader(tx["hist_trend"].format(metric=metric_display_title))
+notes = ("Diseases use different sentinel networks and patient populations; counts and rates are not directly comparable across networks. A dash in the source is treated as missing. " if lang == "EN" else "疾患ごとに定点の種類や対象患者が異なり、報告数や定点当たり報告数を単純に比較できません。原資料の「-」は欠測として扱います。")
+if "Influenza" in selected_diseases:
+    notes += ("From 2025 week 15, the influenza sentinel network changed; interpret trends across this date with care." if lang == "EN" else "2025年第15週からインフルエンザの定点が変更されたため、前後の推移に注意してください。")
+st.caption("Data interpretation" if lang == "EN" else "データの解釈", help=notes)
+
 
 nat_trend = df_filtered[df_filtered['jis_id'] == 0].copy()
 if nat_trend.empty:
@@ -596,10 +611,7 @@ nat_trend['slider_idx'] = nat_trend.apply(lambda r: week_to_idx.get((int(r['year
 nat_trend['week_tag'] = nat_trend.apply(lambda r: f"{int(r['year'])}-W{int(r['week']):02d}", axis=1)
 nat_trend['disease_display'] = nat_trend['disease'].apply(lambda d: DISEASE_TRANSLATIONS[d][lang])
 
-color_map = {
-    DISEASE_TRANSLATIONS["COVID-19"][lang]: COLOR_COVID,
-    DISEASE_TRANSLATIONS["Influenza"][lang]: COLOR_FLU
-}
+color_map = {DISEASE_TRANSLATIONS[d][lang]: color for d, color in zip(selected_diseases, [COLOR_COVID, COLOR_FLU])}
 
 fig_curve = px.line(
     nat_trend, x='date', y=val_col, color='disease_display', markers=True,
@@ -641,27 +653,23 @@ st.subheader(tx["heatmap"].format(year=active_year, week=active_week))
 df_week = df_all[(df_all['year'] == active_year) & (df_all['week'] == active_week) & (df_all['jis_id'] != 0)].copy()
 df_week['display_pref'] = df_week['prefecture_en'] if lang == "EN" else df_week['prefecture_jp']
 
-# Pivot week records for dual-disease comparison
-df_piv = df_week.pivot(index=['prefecture_jp', 'display_pref', 'jis_id'], columns='disease', values=['cases_per_sentinel', 'cases_count']).reset_index()
-df_piv.columns = ['_'.join(c).strip('_') for c in df_piv.columns]
-
-covid_col = f"cases_per_sentinel_COVID-19" if metric_type == "rate" else "cases_count_COVID-19"
-flu_col = f"cases_per_sentinel_Influenza" if metric_type == "rate" else "cases_count_Influenza"
-
-# Keep the original values, including missing data, for both maps and the table.
-df_piv['covid_val'] = df_piv[covid_col]
-df_piv['flu_val'] = df_piv[flu_col]
+# Keep all 47 prefectures, including weeks with missing values.
+df_piv = df_week[df_week['disease'].isin(selected_diseases)].pivot(
+    index=['prefecture_jp', 'display_pref', 'jis_id'], columns='disease', values=val_col
+).reset_index()
+for disease in selected_diseases:
+    if disease not in df_piv:
+        df_piv[disease] = float('nan')
 archive_pref = df_all[df_all['jis_id'] != 0]
-flu_max = archive_pref.loc[archive_pref['disease'] == 'Influenza', val_col].max()
-covid_max = archive_pref.loc[archive_pref['disease'] == 'COVID-19', val_col].max()
-flu_max = float(flu_max) if pd.notna(flu_max) else 0.0
-covid_max = float(covid_max) if pd.notna(covid_max) else 0.0
-df_piv['combined_color'] = df_piv.apply(
-    lambda row: combined_map_color(row['flu_val'], row['covid_val'], flu_max, covid_max), axis=1
-)
-df_piv['dominant'] = df_piv.apply(
-    lambda r: "—" if pd.isna(r['covid_val']) or pd.isna(r['flu_val']) else ("COVID-19" if r['covid_val'] > r['flu_val'] else ("Influenza" if r['flu_val'] > r['covid_val'] else "Balanced")), axis=1
-)
+maxima = {}
+for disease in selected_diseases:
+    maximum = archive_pref.loc[archive_pref['disease'] == disease, val_col].max()
+    maxima[disease] = float(maximum) if pd.notna(maximum) else 0.0
+if len(selected_diseases) == 2:
+    first, second = selected_diseases
+    df_piv['combined_color'] = df_piv.apply(
+        lambda row: combined_map_color(row[second], row[first], maxima[second], maxima[first]), axis=1
+    )
 
 geojson_data = get_japan_geojson()
 if not geojson_data:
@@ -696,106 +704,58 @@ def apply_geo_zoom(fig_target):
         fig_target.update_geos(fitbounds="locations", visible=False)
     fig_target.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0}, height=550)
 
-# Build Map depending on selected checkboxes
-if len(selected_diseases) == 2 and geojson_data:
-    tab_split, tab_combined = st.tabs([tx["map_mode_split"], tx["map_mode_combined"]])
-    
-    with tab_combined:
-        if lang == "EN":
-            st.caption(
-                "White means both values are zero. More influenza adds green; more COVID-19 adds magenta. "
-                "When both are high, the color darkens toward charcoal. Each disease reaches full intensity at "
-                "its highest prefectural value in the loaded archive for the selected metric. "
-                "Blue indicates a missing value."
-            )
-            st.caption(f"Archive maxima — Influenza: {flu_max:,.2f}; COVID-19: {covid_max:,.2f} ({metric_display_title}).")
-        else:
-            st.caption(
-                "白は両疾患がゼロを示します。インフルエンザが増えると緑、COVID-19が増えるとマゼンタが濃くなります。"
-                "両方が高い場合は濃い灰色になります。各疾患の色は、選択した指標について保存済みデータの"
-                "都道府県別最大値で最も濃くなります。青は値が欠けていることを示します。"
-            )
-            st.caption(f"保存済みデータの最大値 — インフルエンザ: {flu_max:,.2f}、COVID-19: {covid_max:,.2f}（{metric_display_title}）")
+# A separate trace for missing values ensures they remain visible in single maps.
+def single_map(disease, color):
+    valid = df_piv[df_piv[disease].notna()]
+    missing = df_piv[df_piv[disease].isna()]
+    fig = px.choropleth(
+        valid, geojson=geojson_data, locations="prefecture_jp", featureidkey="properties.nam_ja",
+        color=disease, range_color=(0, maxima[disease] or 1),
+        color_continuous_scale=[[0, "#ffffff"], [1, color]],
+        hover_name="display_pref", labels={disease: metric_display_title},
+    )
+    if not missing.empty:
+        fig.add_trace(go.Choropleth(
+            geojson=geojson_data, locations=missing['prefecture_jp'], featureidkey="properties.nam_ja",
+            z=[0] * len(missing), colorscale=[[0, "#c6b86a"], [1, "#c6b86a"]],
+            showscale=False, text=missing['display_pref'],
+            hovertemplate="%{text}<br>" + ("No data" if lang == "EN" else "データなし") + "<extra></extra>",
+        ))
+    fig.update_traces(marker_line_color="black", marker_line_width=0.6)
+    apply_geo_zoom(fig)
+    return fig
 
-        # One trace with a stepped scale avoids duplicating the GeoJSON for each color.
+if geojson_data:
+    st.caption("Yellow indicates missing data." if lang == "EN" else "黄色は欠測を示します。")
+    if len(selected_diseases) == 2:
+        first_name, second_name = (DISEASE_TRANSLATIONS[d][lang] for d in selected_diseases)
+        if lang == "EN":
+            st.caption(f"White: both zero. {first_name} adds magenta; {second_name} adds green. Both high: dark gray. Each reaches full intensity at its archive maximum for the selected metric. Yellow: either value missing.")
+            st.caption(f"Archive maxima — {first_name}: {maxima[first]:,.2f}; {second_name}: {maxima[second]:,.2f} ({metric_display_title}).")
+        else:
+            st.caption(f"白は両疾患がゼロ。{first_name}はマゼンタ、{second_name}は緑で示し、両方が高い場合は濃い灰色になります。各色は選択した指標の保存済み最大値で最も濃くなります。黄色はどちらかの値が欠測です。")
+            st.caption(f"保存済み最大値 — {first_name}: {maxima[first]:,.2f}、{second_name}: {maxima[second]:,.2f}（{metric_display_title}）")
         df_piv['color_index'] = range(len(df_piv))
         n_colors = len(df_piv)
-        color_scale = []
+        scale = []
         for index, color in enumerate(df_piv['combined_color']):
-            color_scale.extend([[index / n_colors, color], [(index + 1) / n_colors, color]])
-        fig_map_dual = px.choropleth(
-            df_piv, geojson=geojson_data, locations="prefecture_jp", featureidkey="properties.nam_ja",
-            color="color_index", color_continuous_scale=color_scale, range_color=(-0.5, n_colors - 0.5),
-            hover_name="display_pref",
-            hover_data={
-                "prefecture_jp": False, "color_index": False,
-                "covid_val": ":.2f" if metric_type == "rate" else ":,.0f",
-                "flu_val": ":.2f" if metric_type == "rate" else ":,.0f",
-            },
-            labels={
-                "covid_val": f"COVID-19 ({metric_display_title})",
-                "flu_val": f"{DISEASE_TRANSLATIONS['Influenza'][lang]} ({metric_display_title})",
-            }
-        )
-        fig_map_dual.update_traces(marker_line_color="black", marker_line_width=0.6)
-        fig_map_dual.update_layout(showlegend=False, coloraxis_showscale=False)
-        apply_geo_zoom(fig_map_dual)
-        try: st.plotly_chart(fig_map_dual, width="stretch")
-        except TypeError: st.plotly_chart(fig_map_dual, use_container_width=True)
+            scale.extend([[index / n_colors, color], [(index + 1) / n_colors, color]])
+        fig = px.choropleth(df_piv, geojson=geojson_data, locations="prefecture_jp",
+            featureidkey="properties.nam_ja", color="color_index", color_continuous_scale=scale,
+            range_color=(-0.5, n_colors - 0.5), hover_name="display_pref",
+            hover_data={"prefecture_jp": False, "color_index": False, first: ":.2f", second: ":.2f"},
+            labels={d: DISEASE_TRANSLATIONS[d][lang] for d in selected_diseases})
+        fig.update_traces(marker_line_color="black", marker_line_width=0.6)
+        fig.update_layout(coloraxis_showscale=False)
+        apply_geo_zoom(fig)
+        st.plotly_chart(fig, width="stretch", key="map_combined")
+    else:
+        st.plotly_chart(single_map(selected_diseases[0], COLOR_COVID), width="stretch", key="map_single")
 
-    with tab_split:
-        st.caption("Each scale is fixed to the maximum in the loaded archive." if lang == "EN" else "各色の範囲は保存済みデータの最大値で固定しています。")
-        col_m1, col_m2 = st.columns(2)
-        with col_m1:
-            st.markdown(f"**COVID-19 ({metric_display_title})**")
-            fig_covid = px.choropleth(
-                df_piv, geojson=geojson_data, locations="prefecture_jp", featureidkey="properties.nam_ja",
-                color="covid_val", range_color=(0, max(1, df_all.loc[(df_all.disease == "COVID-19") & (df_all.jis_id != 0), val_col].max())), color_continuous_scale=[[0, "#fdf4ff"], [1, COLOR_COVID]],
-                hover_name="display_pref", labels={"covid_val": metric_display_title}
-            )
-            apply_geo_zoom(fig_covid)
-            try: st.plotly_chart(fig_covid, width="stretch")
-            except TypeError: st.plotly_chart(fig_covid, use_container_width=True)
-            
-        with col_m2:
-            st.markdown(f"**Influenza ({metric_display_title})**")
-            fig_flu = px.choropleth(
-                df_piv, geojson=geojson_data, locations="prefecture_jp", featureidkey="properties.nam_ja",
-                color="flu_val", range_color=(0, max(1, df_all.loc[(df_all.disease == "Influenza") & (df_all.jis_id != 0), val_col].max())), color_continuous_scale=[[0, "#f0fdf4"], [1, COLOR_FLU]],
-                hover_name="display_pref", labels={"flu_val": metric_display_title}
-            )
-            apply_geo_zoom(fig_flu)
-            try: st.plotly_chart(fig_flu, width="stretch")
-            except TypeError: st.plotly_chart(fig_flu, use_container_width=True)
-
-elif len(selected_diseases) == 1 and geojson_data:
-    single_dis = selected_diseases[0]
-    val_active = "covid_val" if single_dis == "COVID-19" else "flu_val"
-    c_scale = [[0, "#fdf4ff"], [1, COLOR_COVID]] if single_dis == "COVID-19" else [[0, "#f0fdf4"], [1, COLOR_FLU]]
-    
-    fig_single = px.choropleth(
-        df_piv, geojson=geojson_data, locations="prefecture_jp", featureidkey="properties.nam_ja",
-        color=val_active, range_color=(0, max(1, df_all.loc[(df_all.disease == single_dis) & (df_all.jis_id != 0), val_col].max())), color_continuous_scale=c_scale,
-        hover_name="display_pref", labels={val_active: metric_display_title}
-    )
-    apply_geo_zoom(fig_single)
-    try: st.plotly_chart(fig_single, width="stretch")
-    except TypeError: st.plotly_chart(fig_single, use_container_width=True)
-
-# --- 8. PREFECTURAL DATA TABLE WITH CLICK-TO-ZOOM ---
-df_table = df_piv.copy()
-sort_col = "covid_val" if ("COVID-19" in selected_diseases and "Influenza" not in selected_diseases) else (
-    "flu_val" if ("Influenza" in selected_diseases and "COVID-19" not in selected_diseases) else "covid_val"
-)
-df_table = df_table.sort_values(by=sort_col, ascending=False)
-
+df_table = df_piv.sort_values(by=selected_diseases[0], ascending=False, na_position="last")
 table_display = pd.DataFrame(index=df_table['display_pref'])
-if "COVID-19" in selected_diseases:
-    table_display[f"COVID-19 ({tx['table_pref'] if metric_type == 'rate' else 'Cases'})"] = df_table['covid_val'].values
-if "Influenza" in selected_diseases:
-    table_display[f"Influenza ({tx['table_pref'] if metric_type == 'rate' else 'Cases'})"] = df_table['flu_val'].values
-if len(selected_diseases) == 2:
-    table_display[tx["dominant_lbl"]] = df_table['dominant'].values
+for disease in selected_diseases:
+    table_display[DISEASE_TRANSLATIONS[disease][lang]] = df_table[disease].values
 
 def on_table_select():
     sel_state = st.session_state.get("pref_table")
